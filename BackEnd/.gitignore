@@ -1,0 +1,28 @@
+# Virtual environment
+.venv/
+venv/
+
+
+# Cache dan logs
+.cache/
+logs/
+*.log
+
+# File besar lainnya
+__pycache__/
+*.pyc
+
+#node
+node_modules/
+dist/
+build/
+.node_modules/
+.next/
+out/
+
+# Python virtual environment
+BackEnd/venv/
+
+# Python cache files
+__pycache__/
+*.pyc
