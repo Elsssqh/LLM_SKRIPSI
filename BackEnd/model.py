@@ -1,808 +1,3 @@
-#----------------------------------------------------------------------------------------------------------------------------------
-
-    # # -*- coding: utf-8 -*-
-    # # Pastikan encoding UTF-8 di awal
-    # # FILE: model.py
-    # # VERSI FINAL: Murni "Chain of Prompts" (Stabil) - Meminta Skor Detail
-
-    # from transformers import AutoModelForCausalLM, AutoTokenizer
-    # import json
-    # import re
-    # import logging
-    # import math
-    # from typing import List, Tuple, Dict, Optional, Any
-    # import time
-    # import jieba
-    # import jieba.posseg as pseg
-    # import torch
-
-    # # ---------------- Logger ----------------
-    # logger = logging.getLogger(__name__)
-    # # Set ke INFO
-    # logging.basicConfig(level=logging.INFO,
-    #                     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
-    # logging.getLogger("tensorflow").setLevel(logging.ERROR)
-    # logging.getLogger("matplotlib").setLevel(logging.ERROR)
-    # logging.getLogger("h5py").setLevel(logging.ERROR)
-    # logging.getLogger("transformers").setLevel(logging.WARNING)
-    # logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
-
-
-    # # ---------------- Helpers ----------------
-    # def cosine_similarity(v1: List[float], v2: List[float]) -> float:
-    #     # (Tidak berubah)
-    #     if not v1 or not v2 or len(v1) != len(v2): return 0.0
-    #     dot = sum(a * b for a, b in zip(v1, v2))
-    #     n1 = math.sqrt(sum(a * a for a in v1))
-    #     n2 = math.sqrt(sum(b * b for b in v2))
-    #     denominator = n1 * n2
-    #     return dot / denominator if denominator != 0 else 0.0
-
-    # # ---------------- QwenScorer ----------------
-
-    # class QwenScorer:
-    #     """ Implementasi Murni Chain of Prompts via model.chat() """
-
-    #     def __init__(self, model_name: str = "Qwen/Qwen-1_8B-Chat"):
-    #         logger.info(f"Memulai inisialisasi QwenScorer (Chain of Prompts) dgn model: {model_name}")
-    #         try:
-    #             self.device = "cuda" if torch.cuda.is_available() else "cpu"
-    #             logger.info(f"Device: {self.device}")
-
-    #             self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    #             logger.info("Tokenizer loaded.")
-
-    #             # --- Perbaikan CPU (Wajib) ---
-    #             logger.info("Loading base model...")
-    #             self.model = AutoModelForCausalLM.from_pretrained(
-    #                 model_name,
-    #                 trust_remote_code=True
-    #             ).to(self.device).eval() # Paksa ke CPU
-    #             logger.info(f"Model Qwen-1.8B loaded to {self.device}.")
-    #             self.config = self.model.config
-    #             # --- Akhir Perbaikan CPU ---
-
-    #             logger.info("Pemuatan file soft prompt (.pt) diskip.") # Konfirmasi skip
-
-    #         except Exception as e:
-    #             logger.exception(f"Gagal memuat model atau tokenizer {model_name}.")
-    #             raise
-    #         try:
-    #             jieba.setLogLevel(logging.WARNING)
-    #             jieba.initialize()
-    #             logger.info("Jieba initialized.")
-    #         except Exception as e:
-    #             logger.warning(f"Failed to initialize Jieba fully: {e}")
-    #             pass
-
-    #         self.rubric_weights = {
-    #             "grammar": 0.30, "vocabulary": 0.30,
-    #             "coherence": 0.20, "cultural_adaptation": 0.20
-    #         }
-    #         logger.info(f"Rubric weights set: {self.rubric_weights}")
-
-    #     # HAPUS _load_soft_prompt, _get_input_embeddings, _generate_with_prompt
-
-    #     def _preprocess_with_jieba(self, essay: str) -> Tuple[str, str]:
-    #         # (Tidak berubah)
-    #         try:
-    #             cleaned_essay = re.sub(r'\s+', '', essay).strip()
-    #             if not cleaned_essay: logger.warning("Empty essay after cleaning."); return "", ""
-    #             words_with_pos = list(pseg.cut(cleaned_essay))
-    #             segmented = " ".join([w for w, flag in words_with_pos if w.strip()])
-    #             pos_lines = "\n".join([f"{w}: {flag}" for w, flag in words_with_pos if w.strip()])
-    #             return segmented, pos_lines
-    #         except Exception as e: logger.exception("Jieba preprocessing failed."); return essay, "Jieba preprocessing failed."
-
-    #     # --- PROMPT BUILDERS ---
-    #     def _build_error_detection_prompt(self, essay: str) -> str:
-    #         # (Prompt error detection tidak berubah)
-    #         return f"""
-    #         您是一位经验丰富的中文语法专家，尤其擅长指导印尼学习者。
-    #         # 您的任务【仅仅】是找出这篇【HSK {hsk_level} 等级】作文中的语法、词汇或语序错误
-    #         请【严格】遵守以下格式：
-    #         - 如果发现错误，请使用此格式： 错误类型 | 错误原文 | 修正建议 | 简短解释
-    #         - 每个错误占一行。
-    #         - 如果【没有发现任何错误】，请【只】回答 'TIDAK ADA KESALAHAN'。
-    #         --- 示例 ---
-    #         示例 1: 输入: 我妹妹是十岁。 输出: 助词误用(是) | 我妹妹是十岁 | 我妹妹十岁 | 表达年龄时通常不需要'是'。
-    #         示例 2: 输入: 我们住雅加达在。 输出: 语序干扰(SPOK) | 我们住雅加达在 | 我们住在雅加达 | 地点状语(在雅加达)应放在动词(住)之前。
-    #         示例 3: 输入: 路很忙。 输出: 词语误用(False Friend) | 路很忙 | 路很拥挤 | '忙'(máng)通常用于人，而非道路。
-    #         示例 4: 输入: 我喜欢学中文。 输出: TIDAK ADA KESALAHAN
-    #         --- 示例结束 ---
-    #         --- 主要任务 ---
-    #         请分析以下作文，找出所有错误。请严格遵守格式。
-    #         作文：
-    #         "{essay}"
-    #         """
-
-    #     # --- PARSER ERROR (Robust) ---
-    #     def _parse_errors_from_text(self, error_response: str, essay_text: str) -> List[Dict[str, Any]]:
-    #         # (Versi robust dari sebelumnya)
-    #         validated_error_list = []
-    #         if not error_response or "TIDAK ADA KESALAHAN" in error_response: return []
-    #         pattern = re.compile(r"^\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*$")
-    #         skip_patterns = [re.compile(r"^\s*示例 \d+:"), re.compile(r"^\s*输入:"), re.compile(r"^\s*输出:"), re.compile(r"^\s*---"), re.compile(r"^\s*$"), re.compile(r"错误类型|错误原文|修正建议|简短解释")]
-    #         logger.debug(f"Error Parser: Parsing response: {repr(error_response)}")
-    #         lines_processed, lines_skipped = 0, 0
-    #         for line in error_response.splitlines():
-    #             line = line.strip(); lines_processed += 1
-    #             should_skip = any(p.search(line) for p in skip_patterns)
-    #             if should_skip: logger.debug(f"Error Parser: Skipping line: '{line}'"); lines_skipped += 1; continue
-    #             match = pattern.match(line)
-    #             if match:
-    #                 try:
-    #                     err_type, incorrect_frag, correction, explanation = map(str, (g.strip() for g in match.groups()))
-    #                     if not incorrect_frag: logger.warning(f"Error Parser: Empty incorrect fragment: '{line}'. Skip."); continue
-    #                     start_index = essay_text.find(incorrect_frag); pos = [start_index, start_index + len(incorrect_frag)] if start_index != -1 else [0, 0]
-    #                     if start_index == -1: logger.warning(f"Error Parser: Pos not found: '{incorrect_frag}'. Use [0,0].")
-    #                     error_entry = {"error_type": err_type, "error_position": pos, "incorrect_fragment": incorrect_frag, "suggested_correction": correction, "explanation": explanation}
-    #                     if all(isinstance(v, (str, list)) for k, v in error_entry.items() if k != 'error_position') and isinstance(pos, list):
-    #                         validated_error_list.append(error_entry); logger.debug(f"Error Parser: Parsed: {error_entry}")
-    #                     else: logger.error(f"Error Parser: Invalid data type: '{line}'. Skip. Data: {error_entry}")
-    #                 except Exception as e: logger.warning(f"Error Parser: Failed matched line: '{line}'. Error: {e}", exc_info=True)
-    #             else: logger.warning(f"Error Parser: Line unmatched: '{line}'")
-    #         logger.info(f"Error Parser Done. Lines: {lines_processed}. Skipped: {lines_skipped}. Errors: {len(validated_error_list)}")
-    #         return validated_error_list
-
-    #     # --- PROMPT SKOR (KEMBALI KE DETAIL) ---
-    #     def _build_scoring_prompt(self, essay: str, hsk_level: int, detected_errors: List[Dict]) -> str:
-    #         """
-    #         Membangun prompt yang meminta SEMUA skor detail (seperti kode asli Anda).
-    #         """
-    #         logger.info("Building DETAILED scoring prompt (requesting all 5 scores).")
-    #         return f"""
-    #         您是HSK作文评分员。
-    #         您的任务【仅仅】是提供分数（0-100）。
-    #         【不要】写任何评语或解释。
-
-    #         HSK等级: {hsk_level}
-    #         作文: "{essay}"
-
-    #         请【必须】按照以下纯文本格式提供所有5个分数。
-    #         【不要】写任何其他文字。
-
-    #         语法准确性: [分数]
-    #         词汇水平: [分数]
-    #         篇章连贯: [分数]
-    #         任务完成度: [分数]
-    #         总体得分: [分数]
-    #         """
-
-    #     # --- PARSER SKOR (KEMBALI KE ASLI - Cari Keyword) ---
-    #     def _extract_scores_from_text(self, text: str) -> Optional[Dict[str, Any]]:
-    #         """
-    #         Mengekstrak skor dari output teks. KEMBALI ke versi asli yang mencari keyword.
-    #         """
-    #         try:
-    #             extracted_data = {"score": {}} # Mulai kosong
-    #             found_any_score = False
-    #             # Pola regex asli Anda
-    #             patterns = {
-    #                 "grammar": r"(?:语法准确性|grammar)\s*[:：分]?\s*(\d{1,3})",
-    #                 "vocabulary": r"(?:词汇水平|vocabulary)\s*[:：分]?\s*(\d{1,3})",
-    #                 "coherence": r"(?:篇章连贯|连贯性|coherence)\s*[:：分]?\s*(\d{1,3})",
-    #                 # Sesuaikan nama kunci 'cultural_adaptation' jika perlu
-    #                 "cultural_adaptation": r"(?:任务完成度|task_fulfillment|cultural_adaptation)\s*[:：分]?\s*(\d{1,3})",
-    #                 "overall": r"(?:总体得分|总分|overall)\s*[:：分]?\s*(\d{1,3})"
-    #             }
-
-    #             logger.debug(f"Score Parser (Keyword): Attempting to extract scores from: {repr(text)}")
-
-    #             for key, pattern in patterns.items():
-    #                 match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-    #                 if match:
-    #                     try:
-    #                         score_val = int(match.group(1))
-    #                         score_clamped = max(0, min(100, score_val))
-    #                         extracted_data["score"][key] = score_clamped # Tambahkan skor jika ditemukan
-    #                         found_any_score = True
-    #                         logger.info(f"Score Parser (Keyword): Found score {key}={score_clamped}")
-    #                     except ValueError:
-    #                         logger.warning(f"Score Parser (Keyword): Value '{match.group(1)}' for '{key}' not int.")
-    #                 # else:
-    #                 #     logger.debug(f"Score Parser (Keyword): Pattern for '{key}' not found.") # Aktifkan jika perlu
-
-    #             # Jika SAMA SEKALI tidak ada keyword skor yang cocok
-    #             if not found_any_score:
-    #                  logger.warning(f"Score Parser (Keyword): NO scores could be extracted via keywords from: {repr(text)}")
-    #                  return None # Kembalikan None jika parsing GAGAL TOTAL
-
-    #             # Jika setidaknya SATU skor ditemukan, pastikan semua key ada (default 0)
-    #             # Ini penting agar generate_json tidak crash saat get()
-    #             final_scores = {}
-    #             for key in patterns: # Iterasi semua key yang DIHARAPKAN
-    #                 final_scores[key] = extracted_data["score"].get(key, 0) # Ambil nilai jika ada, else 0
-    #                 if key not in extracted_data["score"]:
-    #                      logger.warning(f"Score Parser (Keyword): Score for '{key}' not found, setting to 0.")
-
-    #             # Kembalikan dictionary yang lengkap dengan skor (atau 0)
-    #             return {"score": final_scores}
-
-    #         except Exception as e:
-    #             logger.error(f"Score Parser (Keyword): Failed: {e}", exc_info=True)
-    #             return None # Kembalikan None jika ada error tak terduga
-
-    #     # --- PROMPT FEEDBACK ---
-    #     def _build_feedback_prompt(self, essay: str, scores: Dict, errors: List[Dict]) -> str:
-    #         # (Prompt feedback tidak berubah, tapi sekarang bisa menampilkan skor detail jika ada)
-    #         score_summary = (
-    #             f"总体得分: {scores.get('overall', 'N/A')}, "
-    #             f"语法: {scores.get('grammar', 'N/A')}, " # Tampilkan lagi
-    #             f"词汇: {scores.get('vocabulary', 'N/A')}" # Tampilkan lagi
-    #         )
-    #         error_summary = "未发现主要错误。"
-    #         if errors: error_summary = "发现的主要错误:\n" + "".join([f"- {err.get('explanation', 'N/A')}\n" for err in errors[:2]])
-    #         return f"""
-    #         您是一位友好且善于鼓励的中文老师。
-    #         您的任务是根据学生的作文、得分和错误，写一段简短的评语（2-3句话）。
-    #         请用中文书写评语，并在括号()中附上简短的英文语翻译。
-    #         学生作文: "{essay}"
-    #         所得分数: {score_summary}
-    #         错误备注: {error_summary}
-    #         请现在撰写您的评语：
-    #         """
-
-    #     # --- FUNGSI UTAMA: generate_json (Menggunakan model.chat) ---
-    #     def generate_json(self, essay: str, hsk_level: int = 3) -> str:
-    #         start_time = time.time()
-    #         logger.info(f"Request received (Chain of Prompts - Detailed Scores) for HSK {hsk_level}.")
-    #         if not essay or not essay.strip():
-    #              logger.warning("Empty essay input."); error_result = {"error": "Input essay empty.", "essay": essay, "processing_time": "0.00s"}
-    #              try: return json.dumps(error_result, ensure_ascii=False, indent=2)
-    #              except Exception: return '{"error": "Input essay empty and failed to create error JSON."}'
-
-    #         # --- LANGKAH 1: ERROR DETECTION ---
-    #         logger.info("Step 1: Detecting Errors (via model.chat)...")
-    #         validated_error_list = []
-    #         try:
-    #             error_prompt = self._build_error_detection_prompt(essay)
-    #             error_response, _ = self.model.chat(self.tokenizer, error_prompt, history=None, system="您是一位经验丰富的中文语法专家，尤其擅长指导印尼学习者。")
-    #             logger.debug(f"Step 1 Raw Response: {repr(error_response)}")
-    #             validated_error_list = self._parse_errors_from_text(error_response, essay)
-    #             logger.info(f"Step 1 Done. Found {len(validated_error_list)} errors.")
-    #         except Exception as e: logger.exception("Step 1 (Error Detection) Failed."); validated_error_list = []
-
-    #         # --- LANGKAH 2: SCORING (Dengan Parser Keyword Asli) ---
-    #         logger.info("Step 2: Getting Detailed Scores (via model.chat)...")
-    #         # Default skor 0
-    #         parsed_scores = {"grammar": 0, "vocabulary": 0, "coherence": 0, "cultural_adaptation": 0, "overall": 0}
-    #         try:
-    #             # Menggunakan prompt skor DETAIL
-    #             scoring_prompt = self._build_scoring_prompt(essay, hsk_level, validated_error_list)
-    #             scoring_response, _ = self.model.chat(self.tokenizer, scoring_prompt, history=None, system="You are a helpful assistant.")
-    #             logger.info(f"Step 2 Raw Response: {repr(scoring_response)}") # INFO level
-
-    #             # Menggunakan parser skor ASLI (keyword)
-    #             parsed_scores_data = self._extract_scores_from_text(scoring_response)
-
-    #             if parsed_scores_data and "score" in parsed_scores_data:
-    #                  parsed_scores = parsed_scores_data["score"] # Ambil dict skor (sudah di-default 0 jika missing)
-    #                  logger.info(f"Step 2 PARSED scores (might be 0): {parsed_scores}")
-    #             else:
-    #                  # Jika parser kembalikan None (gagal total)
-    #                  logger.error("Step 2 PARSING FAILED: Parser returned None. Using default scores (all 0).")
-    #                  # parsed_scores sudah default 0
-
-    #         except Exception as e:
-    #             logger.exception("Step 2 (Scoring) Failed TOTAL.")
-    #             # parsed_scores sudah default 0
-
-    #         # Ekstrak skor ke variabel individual (setelah try-except)
-    #         grammar_s = parsed_scores.get("grammar", 0)
-    #         vocab_s = parsed_scores.get("vocabulary", 0)
-    #         coherence_s = parsed_scores.get("coherence", 0)
-    #         cultural_s = parsed_scores.get("cultural_adaptation", 0)
-    #         overall_s = parsed_scores.get("overall", 0)
-
-    #         # Hitung ulang overall JIKA 0 tapi komponen lain ada nilainya
-    #         if overall_s == 0 and (grammar_s > 0 or vocab_s > 0 or coherence_s > 0 or cultural_s > 0):
-    #             logger.info("Overall score is 0 but detailed scores exist. Recalculating overall based on weights...")
-    #             calc_score = (grammar_s * self.rubric_weights["grammar"]) + \
-    #                          (vocab_s * self.rubric_weights["vocabulary"]) + \
-    #                          (coherence_s * self.rubric_weights["coherence"]) + \
-    #                          (cultural_s * self.rubric_weights["cultural_adaptation"])
-    #             overall_s = max(0, min(100, int(round(calc_score))))
-    #             logger.info(f"Recalculated overall score: {overall_s}")
-
-    #         logger.info(f"Step 2 Done. Final Scores -> Overall: {overall_s}, Grammar: {grammar_s}, Vocab: {vocab_s}, Coherence: {coherence_s}, Cultural: {cultural_s}")
-
-
-    #         # --- LANGKAH 3: FEEDBACK ---
-    #         logger.info("Step 3: Generating Feedback (via model.chat)...")
-    #         feedback = "Gagal menghasilkan feedback."
-    #         try:
-    #             # Feedback prompt sekarang bisa pakai skor detail
-    #             feedback_prompt = self._build_feedback_prompt(essay, parsed_scores, validated_error_list)
-    #             feedback_response, _ = self.model.chat(self.tokenizer, feedback_prompt, history=None, system="You are a helpful assistant.")
-    #             feedback = feedback_response.strip() if feedback_response else feedback
-    #             if not feedback: # Fallback
-    #                 logger.warning("Step 3: model.chat returned empty feedback. Using fallback.")
-    #                 if not validated_error_list and overall_s > 80: feedback = "作文写得很好...(Esai baik...)"
-    #                 elif validated_error_list: feedback = "作文中发现一些错误...(Ada error...)"
-    #                 else: feedback = "请根据得到的总体分数...(Periksa esai...)"
-    #             logger.info("Step 3 Done.")
-    #             logger.debug(f"Step 3 Feedback: {repr(feedback)}")
-    #         except Exception as e:
-    #             logger.exception("Step 3 (Feedback) Failed TOTAL.")
-    #             if validated_error_list: feedback = "作文中发现一些错误...(Ada error...)"
-    #             elif overall_s > 80: feedback = "作文写得很好...(Esai baik...)"
-    #             else: feedback = "请根据得到的总体分数...(Periksa esai...)"
-
-    #         # --- FINAL ASSEMBLY ---
-    #         final_result = {
-    #             "text": essay, "overall_score": overall_s,
-    #             "detailed_scores": { # Sekarang bisa berisi nilai detail
-    #                 "grammar": grammar_s, "vocabulary": vocab_s,
-    #                 "coherence": coherence_s, "cultural_adaptation": cultural_s
-    #             },
-    #             "error_list": validated_error_list, "feedback": feedback
-    #         }
-    #         duration = time.time() - start_time
-    #         final_result["processing_time"] = f"{duration:.2f} detik"
-    #         logger.info(f"All steps (Chain of Prompts - Detailed) done. Time: {duration:.2f}s.")
-
-    #         # --- Robust JSON Dump ---
-    #         try:
-    #             json_output_string = json.dumps(final_result, ensure_ascii=False, indent=2)
-    #             logger.debug(f"JSON generated successfully:\n{json_output_string[:500]}...")
-    #             return json_output_string
-    #         except TypeError as e:
-    #             logger.error(f"FATAL: Failed converting final_result to JSON! Error: {e}", exc_info=True)
-    #             logger.error(f"Data causing error: {final_result}")
-    #             error_json = {"error": "Internal error: Failed to serialize result.", "details": str(e), "essay": essay, "processing_time": f"{duration:.2f}s"}
-    #             try: return json.dumps(error_json, ensure_ascii=False, indent=2)
-    #             except Exception as final_e: logger.critical(f"ULTRA FATAL: Failed dumping error JSON: {final_e}"); return '{"error": "Internal error: Failed serialization."}'
-    #         # --- End Robust JSON Dump ---
-
-    # # ---------------- Simulasi (Main execution) ----------------
-    # if __name__ == "__main__":
-    #     logger.setLevel(logging.INFO)
-    #     logger.warning("="*50 + "\nRUNNING model.py SCRIPT (Chain of Prompts - DETAILED Scores)\n" + "="*50)
-    #     try:
-    #         scorer = QwenScorer()
-    #         logger.info("\n" + "="*20 + " SIMULATION 1: Good Essay " + "="*20)
-    #         essay_1 = "上个星期六，我和朋友去公园玩。我们早上九点起床。我吃早饭，然后穿衣服。朋友开车带我们去公园。公园里有很多人。我们放风筝，吃午饭，然后回家。我玩得很开心。"
-    #         result_1 = scorer.generate_json(essay_1, hsk_level=2)
-    #         print("\n--- SIMULATION 1 RESULT (JSON) ---"); print(result_1); print("---------------------------------\n")
-    #         logger.info("\n" + "="*20 + " SIMULATION 2: Essay Errors " + "="*20)
-    #         essay_2 = "我妹妹是十岁。我们住雅加达在。今天路很忙。"
-    #         result_2 = scorer.generate_json(essay_2, hsk_level=3)
-    #         print("\n--- SIMULATION 2 RESULT (JSON) ---"); print(result_2); print("---------------------------------\n")
-    #         logger.info("Simulations finished.")
-    #     except Exception as e:
-    #         logger.critical(f"Failed to run main simulation: {e}", exc_info=True)
-
-
-
-
-
-# yg dipakai sekarang:
-# # -*- coding: utf-8 -*-
-# # FILE: model.py
-# # VERSI: Load .pt files dengan model.chat()
-
-# from transformers import AutoModelForCausalLM, AutoTokenizer
-# import json
-# import re
-# import logging
-# import math
-# from typing import List, Tuple, Dict, Optional, Any
-# import time
-# import jieba
-# import jieba.posseg as pseg
-# import torch
-# import torch.nn as nn
-# import os
-
-# # ---------------- Logger ----------------
-# logger = logging.getLogger(__name__)
-# logging.basicConfig(level=logging.INFO,
-#                     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
-# logging.getLogger("tensorflow").setLevel(logging.ERROR)
-# logging.getLogger("matplotlib").setLevel(logging.ERROR)
-# logging.getLogger("h5py").setLevel(logging.ERROR)
-# logging.getLogger("transformers").setLevel(logging.WARNING)
-# logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
-
-# # ---------------- Helpers ----------------
-# def cosine_similarity(v1: List[float], v2: List[float]) -> float:
-#     if not v1 or not v2 or len(v1) != len(v2): return 0.0
-#     dot = sum(a * b for a, b in zip(v1, v2))
-#     n1 = math.sqrt(sum(a * a for a in v1))
-#     n2 = math.sqrt(sum(b * b for b in v2))
-#     denominator = n1 * n2
-#     return dot / denominator if denominator != 0 else 0.0
-
-# # ---------------- QwenScorer ----------------
-# class QwenScorer:
-#     """Implementasi dengan loading file .pt"""
-
-#     def __init__(self, model_name: str = "Qwen/Qwen-1_8B-Chat"):
-#         logger.info(f"Memulai inisialisasi QwenScorer dengan model: {model_name}")
-#         try:
-#             self.device = "cuda" if torch.cuda.is_available() else "cpu"
-#             logger.info(f"Device: {self.device}")
-
-#             self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-#             logger.info("Tokenizer loaded.")
-
-#             self.model = AutoModelForCausalLM.from_pretrained(
-#                 model_name,
-#                 trust_remote_code=True
-#             ).to(self.device).eval()
-#             logger.info(f"Model Qwen-1.8B loaded to {self.device}.")
-#             self.config = self.model.config
-
-#             # --- MEMUAT SOFT PROMPT (.pt files) ---
-#             logger.info("Memuat file soft prompt (.pt)...")
-#             self._load_all_prompts()
-
-#         except Exception as e:
-#             logger.exception(f"Gagal memuat model atau tokenizer {model_name}.")
-#             raise
-        
-#         try:
-#             jieba.setLogLevel(logging.WARNING)
-#             jieba.initialize()
-#             logger.info("Jieba initialized.")
-#         except Exception as e:
-#             logger.warning(f"Failed to initialize Jieba fully: {e}")
-#             pass
-
-#         self.rubric_weights = {
-#             "grammar": 0.30, "vocabulary": 0.30,
-#             "coherence": 0.20, "cultural_adaptation": 0.20
-#         }
-#         logger.info(f"Rubric weights set: {self.rubric_weights}")
-
-#     def _load_all_prompts(self):
-#         """Memuat semua file .pt yang ada"""
-#         prompt_files = {
-#             "error": "error_soft_prompt.pt",
-#             "scoring": "scoring_soft_prompt.pt", 
-#             "feedback": "feedback_soft_prompt.pt"
-#         }
-        
-#         self.prompts = {}
-        
-#         for prompt_type, filename in prompt_files.items():
-#             try:
-#                 if os.path.exists(filename):
-#                     # Load tensor langsung
-#                     prompt_tensor = torch.load(filename, map_location=self.device)
-                    
-#                     # Pastikan shape benar [1, prompt_length, hidden_size]
-#                     if len(prompt_tensor.shape) == 2:
-#                         prompt_tensor = prompt_tensor.unsqueeze(0)  # Add batch dimension
-                    
-#                     self.prompts[prompt_type] = prompt_tensor
-#                     logger.info(f"✅ Berhasil memuat {filename} dengan shape {prompt_tensor.shape}")
-#                 else:
-#                     logger.warning(f"⚠️ File {filename} tidak ditemukan")
-#                     # Buat prompt dummy sebagai fallback
-#                     self.prompts[prompt_type] = torch.randn(1, 20, self.config.hidden_size)
-                    
-#             except Exception as e:
-#                 logger.error(f"❌ Gagal memuat {filename}: {e}")
-#                 # Fallback ke prompt random
-#                 self.prompts[prompt_type] = torch.randn(1, 20, self.config.hidden_size)
-
-#         logger.info(f"Total prompts loaded: {len(self.prompts)}")
-
-#     def _preprocess_with_jieba(self, essay: str) -> Tuple[str, str]:
-#         try:
-#             cleaned_essay = re.sub(r'\s+', '', essay).strip()
-#             if not cleaned_essay: 
-#                 logger.warning("Empty essay after cleaning.")
-#                 return "", ""
-#             words_with_pos = list(pseg.cut(cleaned_essay))
-#             segmented = " ".join([w for w, flag in words_with_pos if w.strip()])
-#             pos_lines = "\n".join([f"{w}: {flag}" for w, flag in words_with_pos if w.strip()])
-#             return segmented, pos_lines
-#         except Exception as e:
-#             logger.exception("Jieba preprocessing failed.")
-#             return essay, "Jieba preprocessing failed."
-
-#     # --- PROMPT BUILDERS dengan integrasi .pt ---
-#     def _build_error_detection_prompt(self, essay: str, hsk_level: int) -> str:
-#         return f"""
-#     您是一位经验丰富的中文语法专家，尤其擅长指导印尼学习者。
-#     您的任务【仅仅】是找出这篇【HSK {hsk_level} 等级】作文中的语法、词汇或语序错误。
-#     请【严格】遵守以下格式：
-#     - 如果发现错误，请使用此格式： 错误类型 | 错误原文 | 修正建议 | 简短解释
-#     - 每个错误占一行。
-#     - 如果【没有发现任何错误】，请【只】回答 'TIDAK ADA KESALAHAN'。
-
-#     示例 1: 输入: 我妹妹是十岁。 输出: 助词误用(是) | 我妹妹是十岁 | 我妹妹十岁 | 表达年龄时通常不需要'是'。
-#     示例 2: 输入: 我们住雅加达在。 输出: 语序干扰(SPOK) | 我们住雅加达在 | 我们住在雅加达 | 地点状语(在雅加达)应放在动词(住)之前。
-#     示例 3: 输入: 路很忙。 输出: 词语误用(False Friend) | 路很忙 | 路很拥挤 | '忙'(máng)通常用于人，而非道路。
-#     示例 4: 输入: 我喜欢学中文。 输出: TIDAK ADA KESALAHAN
-
-#     请分析以下作文，找出所有错误。请严格遵守格式。
-#     作文：
-#     "{essay}"
-#     """
-
-#     def _build_scoring_prompt(self, essay: str, hsk_level: int, detected_errors: List[Dict]) -> str:
-#         error_info = ""
-#         if detected_errors:
-#             error_info = f"\n发现错误数: {len(detected_errors)}"
-            
-#             return f"""
-#             您是HSK作文评分员。请为这篇HSK{hsk_level}作文打分（0-100分）。
-#             {error_info}
-
-#             请按照以下格式提供分数（0-100）：
-#             语法准确性: [分数]
-#             词汇水平: [分数] 
-#             篇章连贯: [分数]
-#             任务完成度: [分数]
-#             总体得分: [分数]
-
-#             作文: "{essay}"
-#             """
-
-#     def _build_feedback_prompt(self, essay: str, scores: Dict, errors: List[Dict]) -> str:
-#         score_summary = f"总体得分: {scores.get('overall', 'N/A')}"
-#         error_summary = "未发现主要错误。"
-#         if errors: 
-#             error_summary = f"发现{len(errors)}个主要错误"
-            
-#         return f"""
-#         您是一位友好且善于鼓励的中文老师。
-#         请根据以下信息写一段简短的评语（2-3句话）：
-#         学生作文: "{essay}"
-#         所得分数: {score_summary}
-#         错误备注: {error_summary}
-
-#         请用中文书写评语，并在括号()中附上简短的英文语翻译。
-#         请现在撰写您的评语：
-#         """
-
-#     # --- PARSER ERROR ---
-#     def _parse_errors_from_text(self, error_response: str, essay_text: str) -> List[Dict[str, Any]]:
-#         validated_error_list = []
-#         if not error_response or "TIDAK ADA KESALAHAN" in error_response: 
-#             return []
-            
-#         pattern = re.compile(r"^\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*$")
-        
-#         for line in error_response.splitlines():
-#             line = line.strip()
-#             match = pattern.match(line)
-#             if match:
-#                 try:
-#                     err_type, incorrect_frag, correction, explanation = map(str, (g.strip() for g in match.groups()))
-#                     if not incorrect_frag:
-#                         continue
-                        
-#                     start_index = essay_text.find(incorrect_frag)
-#                     pos = [start_index, start_index + len(incorrect_frag)] if start_index != -1 else [0, 0]
-                    
-#                     validated_error_list.append({
-#                         "error_type": err_type,
-#                         "error_position": pos,
-#                         "incorrect_fragment": incorrect_frag,
-#                         "suggested_correction": correction, 
-#                         "explanation": explanation
-#                     })
-#                 except Exception as e:
-#                     logger.warning(f"Gagal parsing error line: '{line}'. Error: {e}")
-                    
-#         logger.info(f"Parsed {len(validated_error_list)} errors")
-#         return validated_error_list
-
-#     # --- PARSER SKOR ---
-#     def _extract_scores_from_text(self, text: str) -> Optional[Dict[str, Any]]:
-#         try:
-#             extracted_data = {"score": {}}
-#             patterns = {
-#                 "grammar": r"(?:语法准确性|grammar)\s*[:：分]?\s*(\d{1,3})",
-#                 "vocabulary": r"(?:词汇水平|vocabulary)\s*[:：分]?\s*(\d{1,3})",
-#                 "coherence": r"(?:篇章连贯|连贯性|coherence)\s*[:：分]?\s*(\d{1,3})",
-#                 "cultural_adaptation": r"(?:任务完成度|task_fulfillment|cultural_adaptation)\s*[:：分]?\s*(\d{1,3})",
-#                 "overall": r"(?:总体得分|总分|overall)\s*[:：分]?\s*(\d{1,3})"
-#             }
-
-#             for key, pattern in patterns.items():
-#                 match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-#                 if match:
-#                     try:
-#                         score_val = int(match.group(1))
-#                         score_clamped = max(0, min(100, score_val))
-#                         extracted_data["score"][key] = score_clamped
-#                         logger.info(f"Found score {key}={score_clamped}")
-#                     except ValueError:
-#                         logger.warning(f"Value '{match.group(1)}' for '{key}' not int.")
-
-#             # Jika tidak ada skor yang ditemukan
-#             if not extracted_data["score"]:
-#                 logger.warning("No scores extracted from text")
-#                 return None
-
-#             return extracted_data
-
-#         except Exception as e:
-#             logger.error(f"Score parsing failed: {e}")
-#             return None
-
-#     # --- FUNGSI UTAMA ---
-#     def generate_json(self, essay: str, hsk_level: int = 3) -> str:
-#         start_time = time.time()
-#         logger.info(f"Request received for HSK {hsk_level}.")
-        
-#         if not essay or not essay.strip():
-#             error_result = {
-#                 "error": "Input essay empty.", 
-#                 "essay": essay, 
-#                 "processing_time": "0.00s",
-#                 "hsk_level": hsk_level
-#             }
-#             try: 
-#                 return json.dumps(error_result, ensure_ascii=False, indent=2)
-#             except Exception: 
-#                 return '{"error": "Input essay empty and failed to create error JSON."}'
-
-#         # --- LANGKAH 1: ERROR DETECTION ---
-#         logger.info("Step 1: Detecting Errors...")
-#         validated_error_list = []
-#         try:
-#             error_prompt = self._build_error_detection_prompt(essay, hsk_level)
-#             error_response, _ = self.model.chat(self.tokenizer, error_prompt, history=None)
-#             logger.info(f"Error detection raw response: {error_response[:200]}...")
-#             validated_error_list = self._parse_errors_from_text(error_response, essay)
-#             logger.info(f"Step 1 Done. Found {len(validated_error_list)} errors.")
-#         except Exception as e: 
-#             logger.exception("Step 1 (Error Detection) Failed.")
-#             validated_error_list = []
-
-#         # --- LANGKAH 2: SCORING ---
-#         logger.info("Step 2: Getting Scores...")
-#         parsed_scores = {"grammar": 0, "vocabulary": 0, "coherence": 0, "cultural_adaptation": 0, "overall": 0}
-#         try:
-#             scoring_prompt = self._build_scoring_prompt(essay, hsk_level, validated_error_list)
-#             scoring_response, _ = self.model.chat(self.tokenizer, scoring_prompt, history=None)
-#             logger.info(f"Scoring raw response: {scoring_response[:200]}...")
-            
-#             parsed_scores_data = self._extract_scores_from_text(scoring_response)
-#             if parsed_scores_data and "score" in parsed_scores_data:
-#                 parsed_scores = parsed_scores_data["score"]
-#                 logger.info(f"Parsed scores: {parsed_scores}")
-#         except Exception as e:
-#             logger.exception("Step 2 (Scoring) Failed.")
-
-#         # Calculate overall score if missing
-#         grammar_s = parsed_scores.get("grammar", 0)
-#         vocab_s = parsed_scores.get("vocabulary", 0)
-#         coherence_s = parsed_scores.get("coherence", 0)
-#         cultural_s = parsed_scores.get("cultural_adaptation", 0)
-#         overall_s = parsed_scores.get("overall", 0)
-
-#         if overall_s == 0 and (grammar_s > 0 or vocab_s > 0 or coherence_s > 0 or cultural_s > 0):
-#             logger.info("Recalculating overall score...")
-#             calc_score = (grammar_s * self.rubric_weights["grammar"]) + \
-#                          (vocab_s * self.rubric_weights["vocabulary"]) + \
-#                          (coherence_s * self.rubric_weights["coherence"]) + \
-#                          (cultural_s * self.rubric_weights["cultural_adaptation"])
-#             overall_s = max(0, min(100, int(round(calc_score))))
-
-#         # --- LANGKAH 3: FEEDBACK ---
-#         logger.info("Step 3: Generating Feedback...")
-#         feedback = ""
-#         try:
-#             feedback_prompt = self._build_feedback_prompt(essay, parsed_scores, validated_error_list)
-#             feedback_response, _ = self.model.chat(self.tokenizer, feedback_prompt, history=None)
-#             feedback = feedback_response.strip() if feedback_response else ""
-            
-#             if not feedback:
-#                 if not validated_error_list and overall_s > 80:
-#                     feedback = "作文写得很好，未发现明显错误。继续努力！(Esai ditulis dengan baik, tidak ditemukan kesalahan signifikan. Teruslah berusaha!)"
-#                 elif validated_error_list:
-#                     feedback = "作文中发现一些错误，请查看错误列表了解详情。(Ditemukan beberapa kesalahan dalam esai, silakan periksa daftar kesalahan untuk detailnya.)"
-#                 else:
-#                     feedback = "请根据得到的总体分数检查你的作文。(Harap periksa esai berdasarkan skor yang didapat.)"
-                    
-#             logger.info("Step 3 Done.")
-#         except Exception as e:
-#             logger.exception("Step 3 (Feedback) Failed.")
-#             feedback = "Gagal menghasilkan feedback."
-
-#         # --- FINAL ASSEMBLY ---
-#         final_result = {
-#             "text": essay, 
-#             "hsk_level": hsk_level,
-#             "overall_score": overall_s,
-#             "detailed_scores": {
-#                 "grammar": grammar_s, 
-#                 "vocabulary": vocab_s,
-#                 "coherence": coherence_s, 
-#                 "cultural_adaptation": cultural_s
-#             },
-#             "error_list": validated_error_list, 
-#             "feedback": feedback
-#         }
-        
-#         duration = time.time() - start_time
-#         final_result["processing_time"] = f"{duration:.2f} detik"
-#         logger.info(f"All steps done. Time: {duration:.2f}s")
-
-#         # Robust JSON dump
-#         try:
-#             return json.dumps(final_result, ensure_ascii=False, indent=2)
-#         except Exception as e:
-#             logger.error(f"JSON serialization failed: {e}")
-#             error_json = {
-#                 "error": "Internal error: Failed to serialize result.", 
-#                 "details": str(e), 
-#                 "essay": essay, 
-#                 "hsk_level": hsk_level
-#             }
-#             return json.dumps(error_json, ensure_ascii=False, indent=2)
-
-# # ---------------- Testing ----------------
-# if __name__ == "__main__":
-#     logger.info("Testing model with .pt files...")
-#     try:
-#         scorer = QwenScorer()
-        
-#         # Test essay
-#         test_essay = "我喜欢学习中文。今天天气很好。"
-#         result = scorer.generate_json(test_essay, hsk_level=2)
-#         print("\n=== TEST RESULT ===")
-#         print(result)
-#         print("===================\n")
-        
-#     except Exception as e:
-#         logger.error(f"Test failed: {e}")
-
-# def _load_all_prompts(self):
-#     prompt_files = {
-#         "error": "error_soft_prompt.pt",
-#         "scoring": "scoring_soft_prompt.pt", 
-#         "feedback": "feedback_soft_prompt.pt"
-#     }
-    
-#     self.prompts = {}
-    
-#     for prompt_type, filename in prompt_files.items():
-#         try:
-#             if os.path.exists(filename):
-#                 prompt_tensor = torch.load(filename, map_location=self.device)
-                
-#                 # Handle berbagai kemungkinan shape
-#                 if len(prompt_tensor.shape) == 1:
-#                     # [hidden_size] -> [1, 1, hidden_size]
-#                     prompt_tensor = prompt_tensor.unsqueeze(0).unsqueeze(0)
-#                 elif len(prompt_tensor.shape) == 2:
-#                     # [length, hidden_size] -> [1, length, hidden_size]  
-#                     prompt_tensor = prompt_tensor.unsqueeze(0)
-#                 elif len(prompt_tensor.shape) == 3:
-#                     # [batch, length, hidden_size] -> tetap
-#                     pass
-                    
-#                 # Pastikan hidden size match
-#                 if prompt_tensor.shape[-1] != self.config.hidden_size:
-#                     logger.warning(f"Hidden size mismatch for {filename}. Resizing...")
-#                     # Resize ke hidden size yang benar
-#                     prompt_tensor = prompt_tensor[..., :self.config.hidden_size]
-                
-#                 self.prompts[prompt_type] = prompt_tensor
-#                 logger.info(f"✅ Loaded {filename} with shape {prompt_tensor.shape}")
-                
-#         except Exception as e:
-#             logger.error(f"❌ Failed to load {filename}: {e}")
-#             self.prompts[prompt_type] = torch.randn(1, 20, self.config.hidden_size)
-
-
-
-
-
-
-
-
-
-
 # # -*- coding: utf-8 -*-
 # # FILE: model.py
 # # VERSI: Fixed dengan model.chat() asli dan integrasi .pt files
@@ -1439,7 +634,10 @@ class QwenScorer:
 
             # Valid HSK levels
             self.valid_hsk_levels = [1, 2, 3]
-            
+
+             # Load soft prompts dari file .pt
+            self._load_soft_prompts()
+
             # Rubric weights
             self.rubric_weights = {
                 "grammar": 0.30, 
@@ -1467,6 +665,32 @@ class QwenScorer:
             logger.warning(f"Invalid HSK level: {hsk_level}. Valid levels: {self.valid_hsk_levels}")
             return False
         return True
+    
+    def _load_soft_prompts(self):
+        """Memuat soft prompts dari file .pt"""
+        self.soft_prompts = {}
+        prompt_files = {
+            "error": "error_soft_prompt.pt",
+            "scoring": "scoring_soft_prompt.pt", 
+            "feedback": "feedback_soft_prompt.pt"
+        }
+        
+        for prompt_type, filename in prompt_files.items():
+            try:
+                if os.path.exists(filename):
+                    prompt_tensor = torch.load(filename, map_location=self.device)
+                    # Ensure proper shape [1, seq_len, hidden_size]
+                    if len(prompt_tensor.shape) == 2:
+                        prompt_tensor = prompt_tensor.unsqueeze(0)
+                    elif len(prompt_tensor.shape) == 1:
+                        prompt_tensor = prompt_tensor.unsqueeze(0).unsqueeze(0)
+                    
+                    self.soft_prompts[prompt_type] = prompt_tensor
+                    logger.info(f"✅ Loaded {filename} with shape {prompt_tensor.shape}")
+                else:
+                    logger.warning(f"⚠️ File {filename} tidak ditemukan, menggunakan default prompt")
+            except Exception as e:
+                logger.error(f"❌ Gagal memuat {filename}: {e}")
 
     def _preprocess_with_jieba(self, essay: str) -> Tuple[str, str]:
         """Preprocessing dengan Jieba"""
@@ -1499,24 +723,110 @@ class QwenScorer:
 "{essay}"
 
 请直接输出结果："""
-
     def _build_scoring_prompt(self, essay: str, hsk_level: int, detected_errors: List[Dict]) -> str:
-        """Membangun prompt untuk scoring"""
         error_info = f"发现错误数: {len(detected_errors)}" if detected_errors else "未发现错误"
-        
-        return f"""您是HSK作文评分员。请为这篇HSK{hsk_level}作文打分（0-100分）。
-{error_info}
+        return f"""您是HSK官方作文评分员。请严格按以下规则评分（0–100分）：
 
-请按照以下格式提供分数（0-100）：
-语法准确性: [分数]
-词汇水平: [分数] 
-篇章连贯: [分数]
-任务完成度: [分数]
-总体得分: [分数]
+        规则：
+        - 仅输出5行。
+        - 每行必须以“标签: 数字”格式，无任何额外空格或标点。
+        - 禁止任何解释、空行、Markdown、编号或 karakter tambahan.
 
-作文: "{essay}"
+        输出格式（必须完全 identik）：
+        语法准确性: X
+        词汇水平: X
+        篇章连贯: X
+        任务完成度: X
+        总体得分: X
 
-请直接输出分数："""
+作文（HSK{hsk_level}）：
+"{essay}"
+
+错误摘要：{error_info}
+
+现在请直接输出分数（仅5行，无其他内容）："""
+
+    def _safe_model_chat(self, prompt: str, system_message: str = "You are a helpful assistant.") -> str:
+        """Wrapper aman untuk model.chat dengan error handling DAN temperature=0"""
+        try:
+            if not prompt or not isinstance(prompt, str):
+                logger.error("Invalid prompt provided to model.chat")
+                return ""
+            response, _ = self.model.chat(
+                self.tokenizer,
+                prompt,
+                history=None,
+                system=system_message,
+                temperature=0.0,      # ← KUNCI: deterministik
+                max_new_tokens=128    # cukup untuk 5 baris
+            )
+            return response.strip() if response else ""
+        except Exception as e:
+            logger.error(f"Model chat failed: {e}")
+            return ""
+
+    def _extract_scores_from_text(self, text: str) -> Optional[Dict[str, Any]]:
+        """Extract scores dengan fallback numerik"""
+        try:
+            extracted_data = {"score": {}}
+            patterns = {
+                "grammar": [r"语法准确性\s*[:：]?\s*(\d{1,3})"],
+                "vocabulary": [r"词汇水平\s*[:：]?\s*(\d{1,3})"],
+                "coherence": [r"篇章连贯\s*[:：]?\s*(\d{1,3})"],
+                "cultural_adaptation": [r"任务完成度\s*[:：]?\s*(\d{1,3})"],
+                "overall": [r"总体得分\s*[:：]?\s*(\d{1,3})"]
+            }
+
+            found_scores = False
+            for key, pattern_list in patterns.items():
+                for pattern in pattern_list:
+                    match = re.search(pattern, text, re.IGNORECASE)
+                    if match:
+                        try:
+                            score_val = int(match.group(1))
+                            score_clamped = max(0, min(100, score_val))
+                            extracted_data["score"][key] = score_clamped
+                            logger.info(f"Found score {key}={score_clamped}")
+                            found_scores = True
+                            break
+                        except ValueError:
+                            continue
+
+            # Fallback: jika ada angka 0–100, gunakan sebagai overall
+            if not found_scores:
+                numbers = re.findall(r'\b(\d{1,3})\b', text)
+                for num_str in numbers:
+                    try:
+                        num = int(num_str)
+                        if 0 <= num <= 100:
+                            extracted_data["score"]["overall"] = num
+                            logger.info(f"Fallback: using {num} as overall score")
+                            return extracted_data
+                    except ValueError:
+                        continue
+
+            if not found_scores:
+                logger.warning("No scores extracted, even with numeric fallback")
+                return None
+
+            return extracted_data
+        except Exception as e:
+            logger.error(f"Score parsing failed: {e}")
+            return None
+
+    def _calculate_contextual_scores(self, essay: str, error_count: int) -> Dict[str, int]:
+        """Skor cadangan berdasarkan panjang esai dan error"""
+        char_len = len(essay.strip())
+        base = min(100, 40 + char_len)  # minimal 40
+        error_penalty = min(error_count * 8, 50)
+        overall = max(0, base - error_penalty)
+        return {
+            "overall": overall,
+            "grammar": max(0, overall - error_count * 3),
+            "vocabulary": max(0, overall - error_count * 2),
+            "coherence": max(0, overall - 2),
+            "cultural_adaptation": max(0, overall - 2)
+        }
 
     def _build_feedback_prompt(self, essay: str, scores: Dict, errors: List[Dict]) -> str:
         """Membangun prompt untuk feedback"""
@@ -1524,13 +834,13 @@ class QwenScorer:
         error_summary = "未发现主要错误。" if not errors else f"发现{len(errors)}个主要错误"
         
         return f"""您是一位友好且善于鼓励的中文老师。
-请根据以下信息写一段简短的评语（2-3句话）：
-学生作文: "{essay}"
-所得分数: {score_summary}
-错误备注: {error_summary}
+    请根据以下信息写一段简短的评语（2-3句话）：
+    学生作文: "{essay}"
+    所得分数: {score_summary}
+    错误备注: {error_summary}
 
-请用中文书写评语，并在括号()中附上简短的英文翻译。
-请直接输出评语："""
+    请用中文书写评语，并在括号()中附上简短的英文翻译。
+    请直接输出评语："""
 
     # --- PARSER ERROR ---
     def _parse_errors_from_text(self, error_response: str, essay_text: str) -> List[Dict[str, Any]]:
@@ -1855,3 +1165,5 @@ if __name__ == "__main__":
         logger.error(f"Test failed: {e}")
         import traceback
         traceback.print_exc()
+
+        #----------------------------------------------------------------------------------------------------------------------------------------------
