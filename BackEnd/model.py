@@ -393,24 +393,6 @@ class QwenScorer:
             logger.error(f"Score parsing failed: {e}")
             return None
 
-    def _safe_model_chat(self, prompt: str, system_message: str = "You are a helpful assistant.") -> str:
-        """Wrapper aman untuk model.chat dengan error handling"""
-        try:
-            if not prompt or not isinstance(prompt, str):
-                logger.error("Invalid prompt provided to model.chat")
-                return ""
-                
-            response, _ = self.model.chat(
-                self.tokenizer, 
-                prompt, 
-                history=None, 
-                system=system_message
-            )
-            return response if response else ""
-            
-        except Exception as e:
-            logger.error(f"Model chat failed: {e}")
-            return ""
 
     # --- FUNGSI UTAMA ---
     def generate_json(self, essay: str, hsk_level: int = 2) -> str:
