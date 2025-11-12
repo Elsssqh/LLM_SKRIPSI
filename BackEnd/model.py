@@ -138,20 +138,28 @@ class QwenScorer:
 
     # --- PROMPT BUILDERS ---
     def _build_error_detection_prompt(self, essay: str, hsk_level: int) -> str:
-        """Membangun prompt untuk deteksi error"""
+        """Membangun prompt untuk deteksi error dengan instruksi yang jelas"""
         return f"""您是一位经验丰富的中文语法专家，尤其擅长指导印尼学习者。
-您的任务【仅仅】是找出这篇【HSK {hsk_level} 等级】作文中的语法、词汇或语序错误。
-请【严格】遵守以下格式：
-- 如果发现错误，请使用此格式：错误类型 | 错误原文 | 修正建议 | 简短解释
-- 每个错误占一行。
-- 如果【没有发现任何错误】，请【只】回答 'TIDAK ADA KESALAHAN'。
 
-请分析以下作文，找出所有错误。请严格遵守格式。
+        <作文 HSK {hsk_level}>
+        {essay}
+        </作文>
 
-作文：
-"{essay}"
+        <任务>
+        您的任务【仅仅】是找出作文中的语法、词汇或语序错误。
+        </任务>
 
-请直接输出结果："""
+        <输出格式>
+        - 每个错误占一行。
+        - 【严格】使用此格式：错误类型 | 错误原文 | 修正建议 | 简短解释
+        - 如果【没有发现任何错误】，请【只】回答 'TIDAK ADA KESALAHAN'。
+        </输出格式>
+        请开始您的分析：
+
+        请严格按照<输出格式>中的指示，直接开始输出结果。不要包含任何其他内容。
+        """
+    
+
     def _build_scoring_prompt(self, essay: str, hsk_level: int, detected_errors: List[Dict]) -> str:
         error_info = f"发现错误数: {len(detected_errors)}" if detected_errors else "未发现错误"
         return f"""您是HSK官方作文评分员。请严格按以下规则评分（0–100分）：
@@ -159,7 +167,7 @@ class QwenScorer:
         规则：
         - 仅输出5行。
         - 每行必须以“标签: 数字”格式，无任何额外空格或标点。
-        - 禁止任何解释、空行、Markdown、编号或 karakter tambahan.
+        - 禁止任何解释、空行、Markdown、编号.
 
         输出格式（必须完全 identik）：
         语法准确性: X
@@ -556,3 +564,4 @@ class QwenScorer:
                 "processing_time": f"{duration:.2f}s"
             }
             return json.dumps(error_json, ensure_ascii=False, indent=2)
+
